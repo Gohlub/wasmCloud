@@ -1,22 +1,20 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::Hash;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
 use semver::Version;
-use tracing::debug;
+use tracing::{debug, trace};
 
 use wadm_types::{
     CapabilityProperties, Component, ComponentProperties, ConfigProperty, LinkProperty, Manifest,
-    Metadata, Properties, SecretProperty, Specification, TargetConfig, TraitProperty,
+    Metadata, Policy, Properties, SecretProperty, Specification, TargetConfig, TraitProperty,
 };
 use wash_lib::generate::emoji;
 use wash_lib::parser::{
     DevConfigSpec, DevSecretSpec, InterfaceComponentOverride, ProjectConfig, WitInterfaceSpec,
 };
-use wasmcloud_core::{
-    parse_wit_meta_from_operation, LinkName, WitInterface, WitNamespace, WitPackage,
-};
+use wasmcloud_core::{parse_wit_package_name, LinkName, WitInterface, WitNamespace, WitPackage};
 
 use super::manifest::config_name;
 use super::{
@@ -26,6 +24,24 @@ use super::{
     DEFAULT_MESSAGING_HANDLER_SUBSCRIPTION, DEFAULT_MESSAGING_NATS_PROVIDER_IMAGE,
 };
 
+// Collection of widely used WIT constants to avoid magic strings
+const DEFAULT_LINK_NAME: &str = "default";
+const WIT_IFACE_ATOMICS: &str = "atomics";
+const WIT_IFACE_BATCH: &str = "batch";
+const WIT_IFACE_BLOBSTORE: &str = "blobstore";
+const WIT_IFACE_CONSUMER: &str = "consumer";
+const WIT_IFACE_HANDLER: &str = "handler";
+const WIT_IFACE_INCOMING_HANDLER: &str = "incoming-handler";
+const WIT_IFACE_OUTGOING_HANDLER: &str = "outgoing-handler";
+const WIT_IFACE_STORE: &str = "store";
+const WIT_NS_WASI: &str = "wasi";
+const WIT_NS_WASMCLOUD: &str = "wasmcloud";
+const WIT_NS_WRPC: &str = "wrpc";
+const WIT_PKG_BLOBSTORE: &str = "blobstore";
+const WIT_PKG_HTTP: &str = "http";
+const WIT_PKG_KEYVALUE: &str = "keyvalue";
+const WIT_PKG_MESSAGING: &str = "messaging";
+
 /// Check whether the provided interface is ignored for the purpose of building dependencies.
 ///
 /// Dependencies are ignored normally if they are known-internal packages or interfaces that
@@ -33,11 +49,11 @@ use super::{
 fn is_ignored_iface_dep(ns: &str, pkg: &str, iface: &str) -> bool {
     matches!(
         (ns, pkg, iface),
-        ("wasi", "blobstore", "container" | "types")
-            | ("wasi", "http", "types")
-            | ("wasi", "runtime", "config")
+        (WIT_NS_WASI, "blobstore", "container" | "types")
+            | (WIT_NS_WASI, "http", "types")
+            | (WIT_NS_WASI, "runtime", "config")
             | (
-                "wasi",
+                WIT_NS_WASI,
                 "cli" | "clocks" | "filesystem" | "io" | "logging" | "random" | "sockets",
                 _
             )
@@ -267,71 +283,120 @@ impl DependencySpec {
             None => (iface, None),
             Some((iface, version)) => (iface, semver::Version::parse(version).ok()),
         };
-        let (ns, pkg, iface, _) = parse_wit_meta_from_operation(format!("{iface}.none")).ok()?;
-        match (ns.as_str(), pkg.as_str(), iface.as_str()) {
+        let (ns, packages, interfaces, _, _) = parse_wit_package_name(iface)
+            .context("failed to parse WIT package name from import iface")
+            .ok()?;
+        // NOTE(brooksmtownsend): I'm explicitly making the choice here that `wash dev` will not support the WIT syntax
+        // for nested packages or interfaces right now because it's an extremely uncommon case. I did this to simplify
+        // the matching logic here.
+        match (
+            ns.as_str(),
+            packages.first().map(String::as_str),
+            interfaces
+                .as_ref()
+                .and_then(|i| i.first().map(String::as_str)),
+        ) {
             // Skip explicitly ignored (normally internal) interfaces
-            (ns, pkg, iface) if is_ignored_iface_dep(ns, pkg, iface) => None,
+            (ns, Some(pkg), Some(iface)) if is_ignored_iface_dep(ns, pkg, iface) => None,
+            // Skip interfaces missing package
+            (_, None, _) => None,
             // Deal with known prefixes
-            ("wasi", "keyvalue", "atomics" | "store" | "batch") => {
+            // wasi:keyvalue/atomics|store|batch -> keyvalue-nats
+            (WIT_NS_WASI, Some(WIT_PKG_KEYVALUE), Some(interface))
+                if matches!(
+                    interface,
+                    WIT_IFACE_ATOMICS | WIT_IFACE_STORE | WIT_IFACE_BATCH
+                ) =>
+            {
                 Some(Self::Exports(DependencySpecInner {
                     wit: WitInterfaceSpec {
                         namespace: ns,
-                        package: pkg,
-                        interface: Some(iface),
+                        package: WIT_PKG_KEYVALUE.to_string(),
+                        interfaces: Some(HashSet::from([interface.to_string()])),
                         function: None,
                         version,
                     },
                     delegated_to_workspace: false,
-                    link_name: "default".into(),
+                    link_name: DEFAULT_LINK_NAME.to_string(),
                     image_ref: Some(DEFAULT_KEYVALUE_PROVIDER_IMAGE.into()),
                     is_component: false,
                     configs: Default::default(),
                     secrets: Default::default(),
                 }))
             }
-            ("wasi", "http", "outgoing-handler") => Some(Self::Exports(DependencySpecInner {
-                wit: WitInterfaceSpec {
-                    namespace: ns,
-                    package: pkg,
-                    interface: Some(iface),
-                    function: None,
-                    version,
-                },
-                delegated_to_workspace: false,
-                link_name: "default".into(),
-                image_ref: Some(DEFAULT_HTTP_CLIENT_PROVIDER_IMAGE.into()),
-                is_component: false,
-                configs: Default::default(),
-                secrets: Default::default(),
-            })),
-            ("wasi", "blobstore", "blobstore") | ("wrpc", "blobstore", "blobstore") => {
+            // wasi:http/outgoing-handler -> http-client
+            (WIT_NS_WASI, Some(WIT_PKG_HTTP), Some(interface))
+                if matches!(interface, WIT_IFACE_OUTGOING_HANDLER) =>
+            {
                 Some(Self::Exports(DependencySpecInner {
                     wit: WitInterfaceSpec {
                         namespace: ns,
-                        package: pkg,
-                        interface: Some(iface),
+                        package: WIT_PKG_HTTP.to_string(),
+                        interfaces: Some(HashSet::from([interface.to_string()])),
                         function: None,
                         version,
                     },
                     delegated_to_workspace: false,
-                    link_name: "default".into(),
+                    link_name: DEFAULT_LINK_NAME.to_string(),
+                    image_ref: Some(DEFAULT_HTTP_CLIENT_PROVIDER_IMAGE.into()),
+                    is_component: false,
+                    configs: Default::default(),
+                    secrets: Default::default(),
+                }))
+            }
+            // wasi:blobstore/blobstore -> blobstore-fs
+            (WIT_NS_WASI, Some(WIT_PKG_BLOBSTORE), Some(interface))
+            | (WIT_NS_WRPC, Some(WIT_PKG_BLOBSTORE), Some(interface))
+                if matches!(interface, WIT_IFACE_BLOBSTORE) =>
+            {
+                Some(Self::Exports(DependencySpecInner {
+                    wit: WitInterfaceSpec {
+                        namespace: ns,
+                        package: WIT_PKG_BLOBSTORE.to_string(),
+                        interfaces: Some(HashSet::from([interface.to_string()])),
+                        function: None,
+                        version,
+                    },
+                    delegated_to_workspace: false,
+                    link_name: DEFAULT_LINK_NAME.to_string(),
                     image_ref: Some(DEFAULT_BLOBSTORE_FS_PROVIDER_IMAGE.into()),
                     is_component: false,
                     configs: Default::default(),
                     secrets: Default::default(),
                 }))
             }
-            ("wasmcloud", "messaging", "consumer") => Some(Self::Exports(DependencySpecInner {
+            // wasmcloud:messaging/consumer -> messaging-nats
+            (WIT_NS_WASMCLOUD, Some(WIT_PKG_MESSAGING), Some(interface))
+                if matches!(interface, WIT_IFACE_CONSUMER) =>
+            {
+                Some(Self::Exports(DependencySpecInner {
+                    wit: WitInterfaceSpec {
+                        namespace: ns,
+                        package: WIT_PKG_MESSAGING.to_string(),
+                        interfaces: Some(HashSet::from([interface.to_string()])),
+                        function: None,
+                        version,
+                    },
+                    delegated_to_workspace: false,
+                    link_name: DEFAULT_LINK_NAME.to_string(),
+                    image_ref: Some(DEFAULT_MESSAGING_NATS_PROVIDER_IMAGE.into()),
+                    is_component: false,
+                    configs: Default::default(),
+                    secrets: Default::default(),
+                }))
+            }
+            // Support wildcard interfaces
+            (_, Some(pkg), None) => Some(Self::Exports(DependencySpecInner {
                 wit: WitInterfaceSpec {
                     namespace: ns,
-                    package: pkg,
-                    interface: Some(iface),
+                    package: pkg.to_string(),
+                    interfaces: None,
                     function: None,
                     version,
                 },
                 delegated_to_workspace: false,
-                link_name: "default".into(),
-                image_ref: Some(DEFAULT_MESSAGING_NATS_PROVIDER_IMAGE.into()),
+                link_name: DEFAULT_LINK_NAME.to_string(),
+                image_ref: None,
                 is_component: false,
                 configs: Default::default(),
                 secrets: Default::default(),
@@ -339,16 +404,16 @@ impl DependencySpec {
             // Treat all other dependencies as custom, and track them as dependencies,
             // though they cannot be resolved to a proper dependency without an explicit override/
             // other configuration method
-            _ => Some(Self::Exports(DependencySpecInner {
+            (_, Some(pkg), Some(interface)) => Some(Self::Exports(DependencySpecInner {
                 wit: WitInterfaceSpec {
                     namespace: ns,
-                    package: pkg,
-                    interface: Some(iface),
+                    package: pkg.to_string(),
+                    interfaces: Some(HashSet::from([interface.to_string()])),
                     function: None,
                     version,
                 },
                 delegated_to_workspace: false,
-                link_name: "default".into(),
+                link_name: DEFAULT_LINK_NAME.to_string(),
                 image_ref: None,
                 is_component: false,
                 configs: Default::default(),
@@ -370,37 +435,76 @@ impl DependencySpec {
             None => (iface, None),
             Some((iface, version)) => (iface, semver::Version::parse(version).ok()),
         };
-        let (ns, pkg, iface, _) = parse_wit_meta_from_operation(format!("{iface}.none")).ok()?;
-        match (ns.as_ref(), pkg.as_ref(), iface.as_ref()) {
+        let (ns, packages, interfaces, _, _) = parse_wit_package_name(iface)
+            .context("failed to parse WIT package name from export iface")
+            .ok()?;
+        // NOTE(brooksmtownsend): I'm explicitly making the choice here that `wash dev` will not support the WIT syntax
+        // for nested packages or interfaces right now because it's an extremely uncommon case. I did this to simplify
+        // the matching logic here.
+        match (
+            ns.as_str(),
+            packages.first().map(String::as_str),
+            interfaces
+                .as_ref()
+                .and_then(|i| i.first().map(String::as_str)),
+        ) {
             // Skip explicitly ignored (normally internal) interfaces
-            (ns, pkg, iface) if is_ignored_iface_dep(ns, pkg, iface) => None,
+            (ns, Some(pkg), Some(iface)) if is_ignored_iface_dep(ns, pkg, iface) => None,
+            // Skip interfaces missing package
+            (_, None, _) => None,
             // Handle known interfaces
-            ("wasi", "http", "incoming-handler") => Some(Self::Imports(DependencySpecInner {
+            // wasi:http/incoming-handler -> http-server -> component
+            (WIT_NS_WASI, Some(WIT_PKG_HTTP), Some(interface))
+                if matches!(interface, WIT_IFACE_INCOMING_HANDLER) =>
+            {
+                Some(Self::Imports(DependencySpecInner {
+                    wit: WitInterfaceSpec {
+                        namespace: ns,
+                        package: WIT_PKG_HTTP.to_string(),
+                        interfaces: Some(HashSet::from([interface.to_string()])),
+                        function: None,
+                        version,
+                    },
+                    delegated_to_workspace: false,
+                    link_name: DEFAULT_LINK_NAME.to_string(),
+                    image_ref: Some(DEFAULT_HTTP_SERVER_PROVIDER_IMAGE.into()),
+                    is_component: false,
+                    configs: Default::default(),
+                    secrets: Default::default(),
+                }))
+            }
+            // wasmcloud:messaging/handler -> messaging-nats -> component
+            (WIT_NS_WASMCLOUD, Some(WIT_PKG_MESSAGING), Some(interface))
+                if matches!(interface, WIT_IFACE_HANDLER) =>
+            {
+                Some(Self::Imports(DependencySpecInner {
+                    wit: WitInterfaceSpec {
+                        namespace: ns,
+                        package: WIT_PKG_MESSAGING.to_string(),
+                        interfaces: Some(HashSet::from([interface.to_string()])),
+                        function: None,
+                        version,
+                    },
+                    delegated_to_workspace: false,
+                    link_name: DEFAULT_LINK_NAME.to_string(),
+                    image_ref: Some(DEFAULT_MESSAGING_NATS_PROVIDER_IMAGE.into()),
+                    is_component: false,
+                    configs: Default::default(),
+                    secrets: Default::default(),
+                }))
+            }
+            // Support wildcard interfaces
+            (_, Some(pkg), None) => Some(Self::Exports(DependencySpecInner {
                 wit: WitInterfaceSpec {
                     namespace: ns,
-                    package: pkg,
-                    interface: Some(iface),
+                    package: pkg.to_string(),
+                    interfaces: None,
                     function: None,
                     version,
                 },
                 delegated_to_workspace: false,
-                link_name: "default".into(),
-                image_ref: Some(DEFAULT_HTTP_SERVER_PROVIDER_IMAGE.into()),
-                is_component: false,
-                configs: Default::default(),
-                secrets: Default::default(),
-            })),
-            ("wasmcloud", "messaging", "handler") => Some(Self::Imports(DependencySpecInner {
-                wit: WitInterfaceSpec {
-                    namespace: ns,
-                    package: pkg,
-                    interface: Some(iface),
-                    function: None,
-                    version,
-                },
-                delegated_to_workspace: false,
-                link_name: "default".into(),
-                image_ref: Some(DEFAULT_MESSAGING_NATS_PROVIDER_IMAGE.into()),
+                link_name: DEFAULT_LINK_NAME.to_string(),
+                image_ref: None,
                 is_component: false,
                 configs: Default::default(),
                 secrets: Default::default(),
@@ -408,16 +512,16 @@ impl DependencySpec {
             // Treat all other dependencies as custom, and track them as dependencies,
             // though they cannot be resolved to a proper dependency without an explicit override/
             // other configuration method
-            _ => Some(Self::Imports(DependencySpecInner {
+            (_, Some(pkg), Some(interface)) => Some(Self::Imports(DependencySpecInner {
                 wit: WitInterfaceSpec {
                     namespace: ns,
-                    package: pkg,
-                    interface: Some(iface),
+                    package: pkg.to_string(),
+                    interfaces: Some(HashSet::from([interface.to_string()])),
                     function: None,
                     version,
                 },
                 delegated_to_workspace: false,
-                link_name: "default".into(),
+                link_name: DEFAULT_LINK_NAME.to_string(),
                 image_ref: None,
                 is_component: false,
                 configs: Default::default(),
@@ -560,11 +664,24 @@ impl DependencySpecInner {
             Some(DEFAULT_HTTP_SERVER_PROVIDER_IMAGE) => "http-server".into(),
             Some(DEFAULT_BLOBSTORE_FS_PROVIDER_IMAGE) => "blobstore-fs".into(),
             Some(DEFAULT_MESSAGING_NATS_PROVIDER_IMAGE) => "messaging-nats".into(),
+            // Custom dependencies get the format `custom-<namespace>-<package>-<interfaces>`
             _ => format!(
-                "custom-{}-{}-{}",
+                "custom-{}-{}{}",
                 self.wit.namespace,
                 self.wit.package,
-                self.wit.interface.as_deref().unwrap_or("*"),
+                self.wit
+                    .interfaces
+                    .clone()
+                    .map(|i| {
+                        let mut interfaces = i.into_iter().collect::<Vec<_>>();
+                        if interfaces.is_empty() {
+                            "".to_string()
+                        } else {
+                            interfaces.sort();
+                            format!("-{}", interfaces.join("/"))
+                        }
+                    })
+                    .unwrap_or_default(),
             ),
         }
     }
@@ -585,11 +702,18 @@ impl DependencySpecInner {
         self.delegated_to_workspace = other.delegated_to_workspace;
         self.image_ref = other.image_ref.clone();
         self.link_name = other.link_name.clone();
+        // Extend interfaces with the other interfaces
+        match (&mut self.wit.interfaces, other.wit.interfaces.as_ref()) {
+            (Some(self_ifaces), Some(other_ifaces)) => {
+                self_ifaces.extend(other_ifaces.iter().cloned())
+            }
+            (None, Some(other_ifaces)) => self.wit.interfaces = Some(other_ifaces.clone()),
+            _ => (),
+        }
         // NOTE: We depend on the fact that configs and secrets should be processed in order,
         // with later entries *overriding* earlier ones
-        self.configs.extend(self.configs.clone());
-        // NOTE: we depend on the
-        self.secrets.extend(self.secrets.clone());
+        self.configs.extend(other.configs.clone());
+        self.secrets.extend(other.secrets.clone());
     }
 }
 
@@ -656,7 +780,7 @@ impl ProjectDeps {
                 .iter()
                 .map(|v| {
                     DependencySpec::from_wit_import_iface(&v.interface_spec)
-                        .context("failed to build image ref from interface")
+                        .context("failed to build dependency from import interface override")
                         .map(|dep| (v, dep))
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -666,11 +790,12 @@ impl ProjectDeps {
                 .iter()
                 .map(|v| {
                     DependencySpec::from_wit_export_iface(&v.interface_spec)
-                        .context("failed to build image ref from interface")
+                        .context("failed to build dependency from export interface override")
                         .map(|dep| (v, dep))
                 })
                 .collect::<Result<Vec<_>>>()?,
         );
+        trace!("detected interface overrides {overrides_with_deps:?}");
 
         // Build a list of the final modified dep specs
         let mut deps = Vec::new();
@@ -702,9 +827,11 @@ impl ProjectDeps {
                                 properties: None,
                             })
                         }
-                        DevConfigSpec::Values { values } => {
-                            dep_spec.add_config_properties_to_existing("default", values.clone())
-                        }
+                        DevConfigSpec::Values { values } => dep_spec
+                            .add_config_properties_to_existing(
+                                format!("{}-default", dep_spec.name()),
+                                values.clone(),
+                            ),
                     }
                 }
             }
@@ -808,6 +935,8 @@ impl ProjectDeps {
         // to remove duplicates
         let mut components = HashMap::new();
 
+        let mut contains_secrets = false;
+
         // For each dependency, go through and generate the component along with necessary links
         for dep in self.dependencies.values().flatten() {
             let dep = dep.clone();
@@ -824,17 +953,33 @@ impl ProjectDeps {
                 continue;
             };
 
+            // If there are any secrets present, configure the NATS KV policy
+            match &dep_component.properties {
+                wadm_types::Properties::Capability {
+                    properties: CapabilityProperties { secrets, .. },
+                    ..
+                }
+                | wadm_types::Properties::Component {
+                    properties: ComponentProperties { secrets, .. },
+                    ..
+                } => {
+                    contains_secrets |= !secrets.is_empty();
+                }
+            }
+
             // Generate links for the given component and its spec, for known interfaces
+            // TODO(#3524): When secrets are supported on links, ensure we update the `contains_secrets` var
             match dep {
                 DependencySpec::Exports(DependencySpecInner {
                     wit:
                         WitInterfaceSpec {
                             namespace,
                             package,
-                            interface,
+                            interfaces,
                             version,
                             ..
                         },
+                    image_ref,
                     ..
                 }) => {
                     // Check to see if this link (namespace, package, target) already exists,
@@ -849,8 +994,8 @@ impl ProjectDeps {
                                     && link.package == package
                                     && link.target.name == dep_component.name
                                 {
-                                    if let Some(interface) = &interface {
-                                        link.interfaces.push(interface.into());
+                                    if let Some(interface) = interfaces.clone() {
+                                        link.interfaces.extend(interface.into_iter());
                                     };
                                     return true;
                                 }
@@ -865,10 +1010,7 @@ impl ProjectDeps {
                     let mut link_property = LinkProperty {
                         namespace: namespace.clone(),
                         package: package.clone(),
-                        interfaces: interface
-                            .as_ref()
-                            .map(|iface| vec![iface.into()])
-                            .unwrap_or_default(),
+                        interfaces: interfaces.clone().unwrap_or_default().into_iter().collect(),
                         target: TargetConfig {
                             name: dep_component.name.clone(),
                             ..Default::default()
@@ -880,11 +1022,15 @@ impl ProjectDeps {
                     match (
                         namespace.as_ref(),
                         package.as_ref(),
-                        interface.as_deref(),
+                        interfaces.as_ref(),
                         version,
                     ) {
-                        ("wasi", "blobstore", Some("blobstore"), _)
-                        | ("wrpc", "blobstore", Some("blobstore"), _) => {
+                        (WIT_NS_WASI, "blobstore", interfaces, _)
+                        | (WIT_NS_WRPC, "blobstore", interfaces, _)
+                            if interfaces.is_some_and(|interfaces| {
+                                interfaces.iter().any(|i| i == "blobstore")
+                            }) =>
+                        {
                             link_property.target.config.push(ConfigProperty {
                                 name: config_name(namespace.as_str(), package.as_str()),
                                 properties: Some(HashMap::from([(
@@ -893,7 +1039,16 @@ impl ProjectDeps {
                                 )])),
                             });
                         }
-                        ("wasi", "keyvalue", Some("atomics" | "store" | "batch"), _) => {
+                        // Use the default bucket for the NATS KV store
+                        (WIT_NS_WASI, "keyvalue", interfaces, _)
+                            if image_ref.as_ref().is_some_and(|image_ref| {
+                                image_ref == DEFAULT_KEYVALUE_PROVIDER_IMAGE
+                            }) && interfaces.is_some_and(|interfaces| {
+                                interfaces
+                                    .iter()
+                                    .any(|i| i == "atomics" || i == "store" || i == "batch")
+                            }) =>
+                        {
                             link_property.target.config.push(ConfigProperty {
                                 name: config_name(namespace.as_str(), package.as_str()),
                                 properties: Some(HashMap::from([
@@ -918,7 +1073,7 @@ impl ProjectDeps {
                         WitInterfaceSpec {
                             namespace,
                             package,
-                            interface,
+                            interfaces,
                             version,
                             ..
                         },
@@ -928,10 +1083,7 @@ impl ProjectDeps {
                     let mut link_property = LinkProperty {
                         namespace: namespace.clone(),
                         package: package.clone(),
-                        interfaces: interface
-                            .as_ref()
-                            .map(|iface| vec![iface.into()])
-                            .unwrap_or_default(),
+                        interfaces: interfaces.clone().unwrap_or_default().into_iter().collect(),
                         target: TargetConfig {
                             name: component.name.clone(),
                             ..Default::default()
@@ -943,10 +1095,14 @@ impl ProjectDeps {
                     match (
                         namespace.as_ref(),
                         package.as_ref(),
-                        interface.as_deref(),
+                        interfaces.as_ref(),
                         version,
                     ) {
-                        ("wasi", "http", Some("incoming-handler"), _) => {
+                        (WIT_NS_WASI, "http", interfaces, _)
+                            if interfaces.is_some_and(|interfaces| {
+                                interfaces.iter().any(|i| i == "incoming-handler")
+                            }) =>
+                        {
                             link_property
                                 .source
                                 .get_or_insert(Default::default())
@@ -959,7 +1115,11 @@ impl ProjectDeps {
                                     )])),
                                 });
                         }
-                        ("wasmcloud", "messaging", Some("handler"), _) => {
+                        ("wasmcloud", "messaging", interfaces, _)
+                            if interfaces.is_some_and(|interfaces| {
+                                interfaces.iter().any(|i| i == "handler")
+                            }) =>
+                        {
                             link_property
                                 .source
                                 .get_or_insert(Default::default())
@@ -999,6 +1159,15 @@ impl ProjectDeps {
             debug!("replacing duplicate component [{}]", c.name);
         }
 
+        let policies = if contains_secrets {
+            vec![Policy {
+                name: "nats-kv".into(),
+                policy_type: "policy.secret.wasmcloud.dev/v1alpha1".to_string(),
+                properties: BTreeMap::from([("backend".to_string(), "nats-kv".to_string())]),
+            }]
+        } else {
+            vec![]
+        };
         manifests.push(Manifest {
             api_version: "core.oam.dev/v1beta1".into(),
             kind: "Application".into(),
@@ -1023,7 +1192,7 @@ impl ProjectDeps {
             },
             spec: Specification {
                 components: components.into_values().collect(),
-                policies: Vec::with_capacity(0),
+                policies,
             },
         });
 

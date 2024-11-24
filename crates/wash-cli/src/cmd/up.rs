@@ -29,8 +29,9 @@ use wash_lib::context::ContextManager;
 use wash_lib::generate::emoji;
 use wash_lib::start::{
     ensure_nats_server, ensure_wadm, ensure_wasmcloud, find_wasmcloud_binary, nats_pid_path,
-    start_nats_server, start_wadm, start_wasmcloud_host, NatsConfig, WadmConfig,
-    NATS_SERVER_BINARY, NATS_SERVER_CONF, WADM_PID,
+    new_patch_version_of_after_string, start_nats_server, start_wadm, start_wasmcloud_host,
+    NatsConfig, WadmConfig, GITHUB_WASMCLOUD_ORG, GITHUB_WASMCLOUD_WADM_REPO,
+    GITHUB_WASMCLOUD_WASMCLOUD_REPO, NATS_SERVER_BINARY, NATS_SERVER_CONF, WADM_PID,
 };
 use wasmcloud_control_interface::{Client as CtlClient, ClientBuilder as CtlClientBuilder};
 
@@ -152,9 +153,13 @@ impl From<NatsOpts> for NatsConfig {
 
 #[derive(Parser, Debug, Clone)]
 pub struct WasmcloudOpts {
-    /// wasmCloud host version to download, e.g. `v0.55.0`. See https://github.com/wasmCloud/wasmcloud/releases for releases
-    #[clap(long = "wasmcloud-version", default_value = WASMCLOUD_HOST_VERSION, env = "WASMCLOUD_VERSION")]
-    pub wasmcloud_version: String,
+    /// wasmcloud host version to download, e.g. `v1.4.2`.
+    ///
+    /// defaults to the [`WASMCLOUD_HOST_VERSION`] if not provided
+    /// or the latest patch version after that when `wash up` issued,
+    /// see <https://github.com/wasmCloud/wasmCloud/releases> for releases
+    #[clap(long = "wasmcloud-version", env = "WASMCLOUD_VERSION")]
+    pub wasmcloud_version: Option<String>,
 
     /// A unique identifier for a lattice, frequently used within NATS topics to isolate messages among different lattices
     #[clap(
@@ -361,9 +366,13 @@ impl WasmcloudOpts {
 
 #[derive(Parser, Debug, Clone)]
 pub struct WadmOpts {
-    /// wadm version to download, e.g. `v0.4.0`. See https://github.com/wasmCloud/wadm/releases for releases
-    #[clap(long = "wadm-version", default_value = WADM_VERSION, env = "WADM_VERSION")]
-    pub wadm_version: String,
+    /// wadm version to download, e.g. `v0.18.0`.
+    ///
+    /// defaults to the [`WADM_VERSION`] if not provided
+    /// or the latest patch version after that when `wash up` issued,
+    /// see <https://github.com/wasmCloud/wadm/releases> for releases
+    #[clap(long = "wadm-version", env = "WADM_VERSION")]
+    pub wadm_version: Option<String>,
 
     /// If enabled, wadm will not be downloaded or run as a part of the up command
     #[clap(long = "disable-wadm")]
@@ -422,6 +431,7 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
             .cluster_seed
             .or_else(|| ctx.cluster_seed.map(|seed| seed.to_string())),
         wasmcloud_js_domain: cmd.wasmcloud_opts.wasmcloud_js_domain.or(ctx.js_domain),
+        wasmcloud_version: cmd.wasmcloud_opts.wasmcloud_version.clone(),
         ..cmd.wasmcloud_opts
     };
     let host_env = configure_host_env(wasmcloud_opts.clone()).await?;
@@ -563,7 +573,8 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
             .into_std()
             .await;
 
-        let wadm_path = ensure_wadm(&cmd.wadm_opts.wadm_version, &install_dir).await;
+        let wadm_path =
+            install_patch_or_default_wadm_version(&cmd.wadm_opts.wadm_version, &install_dir).await;
         match wadm_path {
             Ok(wadm_bin_path) => {
                 let wadm_child = start_wadm(
@@ -582,7 +593,10 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
                 }
             }
             Err(e) => {
-                let wadm_version: String = cmd.wadm_opts.wadm_version.clone();
+                let wadm_version: String = cmd
+                    .wadm_opts
+                    .wadm_version
+                    .unwrap_or(WADM_VERSION.to_string());
                 eprintln!("🟨 Couldn't download wadm {wadm_version}: {e}");
                 if e.to_string().contains("Text file busy") {
                     eprintln!("🛟 Please ensure there aren't any leftover wadm processes");
@@ -593,7 +607,24 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
     } else {
         None
     };
-
+    let wasmcloud_version = if let Some(version) = wasmcloud_opts.wasmcloud_version {
+        version
+    } else if let Some(new_version) = (new_patch_version_of_after_string(
+        GITHUB_WASMCLOUD_ORG,
+        GITHUB_WASMCLOUD_WASMCLOUD_REPO,
+        WASMCLOUD_HOST_VERSION,
+    )
+    .await)
+        .unwrap_or_default()
+    {
+        new_version.to_string()
+    } else {
+        WASMCLOUD_HOST_VERSION.to_string()
+    };
+    let wasmcloud_version = match wasmcloud_version {
+        version if version.starts_with('v') => version,
+        version => format!("v{}", version),
+    };
     // Download wasmCloud if not already installed
     let wasmcloud_bin_path = match wasmcloud_opts.host_path {
         // If an override was provided we can use it
@@ -607,13 +638,12 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
         // If start only was not specified, we can download the binary
         None if !wasmcloud_opts.start_only => {
             spinner.update_spinner_message(" Downloading wasmCloud ...".to_string());
-            ensure_wasmcloud(&wasmcloud_opts.wasmcloud_version, &install_dir).await?
+
+            ensure_wasmcloud(&wasmcloud_version, &install_dir).await?
         }
         // If no override was provided, we must attempt to find the binary
         None => {
-            if let Some(path) =
-                find_wasmcloud_binary(&install_dir, &wasmcloud_opts.wasmcloud_version).await
-            {
+            if let Some(path) = find_wasmcloud_binary(&install_dir, &wasmcloud_version).await {
                 path
             } else {
                 // Ensure we clean up the NATS server and wadm if we can't start wasmCloud
@@ -640,7 +670,6 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
     } else {
         Stdio::piped()
     };
-    let version = wasmcloud_opts.wasmcloud_version;
 
     let mut wasmcloud_child = match start_wasmcloud_host(
         &wasmcloud_bin_path,
@@ -691,7 +720,7 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
 
     // Write the pid file with the selected version and process ID.
     let pid_file_contents = json!({
-        "version": version,
+        "version": wasmcloud_version,
         "pid": wasmcloud_child.id().unwrap()
     });
 
@@ -732,9 +761,14 @@ pub async fn handle_up(cmd: UpCommand, output_kind: OutputKind) -> Result<Comman
         "CTRL+c received, stopping wasmCloud, wadm, and NATS...".to_string(),
     );
     stop_wasmcloud(wasmcloud_child).await?;
-    tokio::fs::remove_file(host_pid_file()?).await?;
+    if let Err(e) = tokio::fs::remove_file(host_pid_file()?).await {
+        warn!("failed to remove host pid file: {e}");
+    };
 
-    if wadm_process.is_some() {
+    if let Some(mut wadm_process) = wadm_process {
+        if let Err(e) = wadm_process.kill().await {
+            warn!("failed to kill wadm: {e}");
+        };
         // remove wadm pidfile, the process is stopped automatically by CTRL+c
         remove_wadm_pidfile(&install_dir).await?;
     }
@@ -912,6 +946,50 @@ pub(crate) async fn start_nats(
     }
 
     Ok(nats_process)
+}
+
+/// Helper function to run an optimistic patch update, but fall back to the previous version if the new version fails
+/// to download.
+async fn install_patch_or_default_wadm_version(
+    version: &Option<String>,
+    install_dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(version) = version {
+        return ensure_wadm(version, install_dir).await;
+    }
+
+    let version = version.clone().unwrap_or_else(|| WADM_VERSION.to_owned());
+    let new_patch_version = (new_patch_version_of_after_string(
+        GITHUB_WASMCLOUD_ORG,
+        GITHUB_WASMCLOUD_WADM_REPO,
+        &version,
+    )
+    .await)
+        .unwrap_or_default();
+    match new_patch_version {
+        Some(new_patch) => {
+            eprintln!(
+                "{} Found a new patch version of wadm: {}",
+                emoji::INFO_SQUARE,
+                new_patch
+            );
+            // Re-add stripped 'v' prefix due to semver parsing
+            let new_version = format!("v{}", new_patch);
+            match ensure_wadm(&new_version, install_dir).await {
+                Ok(path) => Ok(path),
+                Err(e) => {
+                    debug!(
+                        "🟨 Couldn't download the patched wadm {new_version}, falling back to {version}: {e}"
+                    );
+                    ensure_wadm(&version, install_dir).await
+                }
+            }
+        }
+        None => {
+            debug!("No new version found, using the provided: {}", version);
+            ensure_wadm(&version, install_dir).await
+        }
+    }
 }
 
 /// Helper function to run wasmCloud in interactive mode
@@ -1201,7 +1279,7 @@ mod tests {
         );
         assert_eq!(
             up_all_flags.wasmcloud_opts.wasmcloud_version,
-            "v0.57.1".to_string()
+            Some("v0.57.1".to_string())
         );
         assert_eq!(
             up_all_flags.wasmcloud_opts.lattice.unwrap(),

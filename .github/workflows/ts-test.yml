@@ -12,6 +12,9 @@ defaults:
   run:
     working-directory: ./typescript
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: test:format-lint-unit
@@ -61,7 +64,7 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Install `wash` CLI
-        uses: taiki-e/install-action@15d8c416d16bd924ecd41f97bb1a90d2cfa695f4
+        uses: taiki-e/install-action@33e32f55072c61d57aa7ddee0fc8e94f46298976
         with:
           tool: wash-cli@${{ matrix.wash.version }}
 

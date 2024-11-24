@@ -11,13 +11,14 @@ use wasmcloud_control_interface::Client as CtlClient;
 
 use wadm_types::{ConfigProperty, Manifest, Properties, SecretProperty, SecretSourceProperty};
 use wash_lib::build::{build_project, SignConfig};
-use wash_lib::cli::CommonPackageArgs;
+use wash_lib::cli::{CommonPackageArgs, OutputKind};
 use wash_lib::generate::emoji;
 use wash_lib::parser::{
     DevConfigSpec, DevManifestComponentTarget, DevSecretSpec, ProjectConfig, TypeConfig,
 };
 
 use crate::app::deploy_model_from_manifest;
+use crate::appearance::spinner::Spinner;
 
 use super::deps::{DependencySpec, ProjectDependencyKey, ProjectDeps};
 use super::manifest::{generate_component_from_project_cfg, generate_help_text_for_manifest};
@@ -40,13 +41,12 @@ pub(crate) struct RunLoopState<'a> {
     pub(crate) component_ref: Option<String>,
     pub(crate) package_args: &'a CommonPackageArgs,
     pub(crate) skip_fetch: bool,
+    pub(crate) output_kind: OutputKind,
 }
 
 /// Generate manifests that should be deployed, based on the current run loop state
 pub(crate) async fn generate_manifests(
     RunLoopState {
-        dev_session,
-        ctl_client,
         project_cfg,
         session_id,
         ref mut previous_deps,
@@ -74,14 +74,7 @@ pub(crate) async fn generate_manifests(
     // Pull implied dependencies from WIT
     let wit_implied_deps = discover_dependencies_from_wit(resolve, world_id)
         .context("failed to resolve dependent components")?;
-    eprintln!(
-        "{} Detected component dependencies: {:?}",
-        emoji::INFO_SQUARE,
-        wit_implied_deps
-            .iter()
-            .map(DependencySpec::name)
-            .collect::<BTreeSet<String>>()
-    );
+
     let pkey = ProjectDependencyKey::from_project(
         &project_cfg.common.name,
         &project_cfg.common.project_dir,
@@ -90,7 +83,6 @@ pub(crate) async fn generate_manifests(
 
     let mut current_project_deps = ProjectDeps::from_known_deps(pkey.clone(), wit_implied_deps)
         .context("failed to build project dependencies")?;
-
     // Pull and merge in overrides from project-level wasmcloud.toml
     let project_override_deps = ProjectDeps::from_project_config_overrides(pkey, project_cfg)
         .with_context(|| {
@@ -102,6 +94,16 @@ pub(crate) async fn generate_manifests(
     current_project_deps
         .merge_override(project_override_deps)
         .context("failed to merge & override project-specified deps")?;
+    eprintln!(
+        "{} Detected component dependencies: {:?}",
+        emoji::INFO_SQUARE,
+        current_project_deps
+            .dependencies
+            .values()
+            .flatten()
+            .map(DependencySpec::name)
+            .collect::<BTreeSet<String>>()
+    );
 
     // After we've merged, we can update the session ID to belong to this session
     current_project_deps.session_id = Some(session_id.to_string());
@@ -118,31 +120,8 @@ pub(crate) async fn generate_manifests(
     let project_deps_unchanged = previous_deps
         .as_ref()
         .is_some_and(|deps| deps.eq(&current_project_deps));
+    // Return with no generated manifests if deps haven't changed
     if project_deps_unchanged {
-        eprintln!(
-            "{} {}",
-            emoji::RECYCLE,
-            style(format!(
-                "(Fast-)Reloading component [{component_id}] (no dependencies have changed)..."
-            ))
-            .bold()
-        );
-        // Scale the component to zero, trusting that wadm will re-create it
-        scale_down_component(
-            ctl_client,
-            project_cfg,
-            &dev_session
-                .host_data
-                .as_ref()
-                .context("missing host ID for session")?
-                .0,
-            component_id,
-            component_ref,
-        )
-        .await
-        .with_context(|| format!("failed to reload component [{component_id}]"))?;
-
-        // Return with no generated manifests
         return Ok(Vec::new());
     }
 
@@ -342,11 +321,16 @@ async fn update_secret_properties_by_spec(
 /// Run one iteration of the development loop
 pub(crate) async fn run(state: &mut RunLoopState<'_>) -> Result<()> {
     // Build the project (equivalent to `wash build`)
-    eprintln!(
-        "{} {}",
-        emoji::CONSTRUCTION_BARRIER,
-        style("Building project...").bold(),
-    );
+    let spinner = Spinner::new(&state.output_kind).context("failed to create spinner")?;
+    if matches!(state.output_kind, OutputKind::Text) {
+        spinner.update_spinner_message("Building project...");
+    } else {
+        eprintln!(
+            "{} {}",
+            emoji::CONSTRUCTION_BARRIER,
+            style("Building project...").bold(),
+        );
+    }
     // Build the project (equivalent to `wash build`)
     let built_artifact_path = match build_project(
         state.project_cfg,
@@ -369,6 +353,7 @@ pub(crate) async fn run(state: &mut RunLoopState<'_>) -> Result<()> {
             return Ok(());
         }
     };
+    spinner.finish_and_clear();
     eprintln!(
         "{} Successfully built project at [{}]",
         emoji::GREEN_CHECK,
@@ -423,6 +408,41 @@ pub(crate) async fn run(state: &mut RunLoopState<'_>) -> Result<()> {
         .as_ref()
         .context("unexpectedly missing component_ref")?;
 
+    // If manifests are empty, let the user know we're not deploying anything, just reloading
+    // the same component
+    if manifests.is_empty() {
+        eprintln!(
+            "{} {}",
+            emoji::RECYCLE,
+            style(format!(
+                "(Fast-)Reloading component [{component_id}] (no dependencies have changed)..."
+            ))
+            .bold()
+        );
+    } else {
+        eprintln!(
+            "{} {}",
+            emoji::RECYCLE,
+            style(format!("Reloading component [{component_id}]...")).bold()
+        );
+    }
+
+    // Scale the component to zero, trusting that wadm will re-create it
+    scale_down_component(
+        state.ctl_client,
+        state.project_cfg,
+        &state
+            .dev_session
+            .host_data
+            .as_ref()
+            .context("missing host ID for session")?
+            .0,
+        component_id,
+        component_ref,
+    )
+    .await
+    .with_context(|| format!("failed to reload component [{component_id}]"))?;
+
     // Apply all manifests
     for manifest in manifests {
         // Generate all help text for this manifest
@@ -473,7 +493,7 @@ pub(crate) async fn run(state: &mut RunLoopState<'_>) -> Result<()> {
             "{} {}",
             emoji::RECYCLE,
             style(format!(
-                "Deployed development manifest for application [{}]",
+                "Deployed updated manifest for application [{}]",
                 manifest.metadata.name,
             ))
             .bold(),
@@ -484,27 +504,6 @@ pub(crate) async fn run(state: &mut RunLoopState<'_>) -> Result<()> {
             eprintln!("{}", help_text_lines.join("\n"));
         }
     }
-
-    eprintln!(
-        "{} {}",
-        emoji::RECYCLE,
-        style(format!("Reloading component [{component_id}]...")).bold()
-    );
-    // Scale the component to zero, trusting that wadm will re-create it
-    scale_down_component(
-        state.ctl_client,
-        state.project_cfg,
-        &state
-            .dev_session
-            .host_data
-            .as_ref()
-            .context("missing host ID for session")?
-            .0,
-        component_id,
-        component_ref,
-    )
-    .await
-    .with_context(|| format!("failed to reload component [{component_id}]"))?;
 
     Ok(())
 }

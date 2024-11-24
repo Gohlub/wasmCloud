@@ -19,6 +19,7 @@ use tokio::{
     time::Duration,
 };
 
+use wash_cli::config::{WADM_VERSION, WASMCLOUD_HOST_VERSION};
 use wash_lib::cli::output::{
     AppDeleteCommandOutput, AppDeployCommandOutput, AppGetCommandOutput, AppListCommandOutput,
     AppUndeployCommandOutput, CallCommandOutput, GetHostsCommandOutput, PullCommandOutput,
@@ -228,7 +229,7 @@ impl Drop for TestWashInstance {
 }
 
 /// Arguments for creating a new `TestWashInstance`
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Default)]
 struct TestWashInstanceNewArgs {
     /// Extra arguments to feed to `wash up`
     pub extra_args: Vec<String>,
@@ -245,13 +246,21 @@ impl TestWashInstance {
     pub async fn create_with_extra_args(
         args: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Result<Self> {
-        Self::new(TestWashInstanceNewArgs {
-            extra_args: args
-                .into_iter()
-                .map(|v| v.as_ref().to_string())
-                .collect::<Vec<String>>(),
-        })
-        .await
+        let mut extra_args = args
+            .into_iter()
+            .map(|v| v.as_ref().to_string())
+            .collect::<Vec<String>>();
+        // we pin the optional wadm and wascloudhost versions
+        // to the current release, to avoid undefined behaviour in tests
+        if !extra_args.contains(&"--wadm-version".to_string()) {
+            extra_args.push("--wadm-version".to_string());
+            extra_args.push(WADM_VERSION.to_string());
+        }
+        if !extra_args.contains(&"--wasmcloud-version".to_string()) {
+            extra_args.push("--wasmcloud-version".to_string());
+            extra_args.push(WASMCLOUD_HOST_VERSION.to_string());
+        }
+        Self::new(TestWashInstanceNewArgs { extra_args }).await
     }
 
     async fn new(args: TestWashInstanceNewArgs) -> Result<Self> {
@@ -1018,14 +1027,9 @@ pub async fn init_workspace(component_names: Vec<&str>) -> Result<WorkspaceTestS
 /// expecting that the wasmcloud process invocation contains `wasmcloud_host`
 #[allow(dead_code)]
 pub async fn wait_for_no_hosts() -> Result<()> {
-    wait_until_process_has_count(
-        WASMCLOUD_HOST_BIN,
-        |v| v == 0,
-        Duration::from_secs(15),
-        Duration::from_millis(250),
-    )
-    .await
-    .context("number of hosts running is still non-zero")?;
+    wait_for_num_hosts(0)
+        .await
+        .context("number of hosts running is still non-zero")?;
     let lockfile = host_pid_file()?;
     if wait_for_file_to_be_removed(&lockfile).await.is_err() {
         // If the PID file wasn't removed, attempt to delete it manually
@@ -1037,6 +1041,18 @@ pub async fn wait_for_no_hosts() -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+/// Waits until the number of hosts running matches the expected number
+pub async fn wait_for_num_hosts(num_hosts: usize) -> Result<()> {
+    wait_until_process_has_count(
+        WASMCLOUD_HOST_BIN,
+        |v| v == num_hosts,
+        Duration::from_secs(15),
+        Duration::from_millis(250),
+    )
+    .await
+    .context(format!("number of hosts running is not [{num_hosts}]"))
 }
 
 /// Wait for a file to be removed.

@@ -4,13 +4,16 @@ on:
   workflow_call: {}
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     name: washboard-ui
 
     runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -24,7 +27,7 @@ jobs:
           # - path pattern: `path/to/project/v1.2.3`
           # - package pattern: `refs/tags/package-name-v1.2.3`
           # - tag only pattern: `refs/tags/v1.2.3`
-          pattern: '^refs\/tags\/(?:.*\/|[a-z-]*)?v?(.*)$'
+          pattern: '^(?:.*\/|[a-z-]*)?v?(.*)$'
 
       - name: Download Asset
         uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
@@ -42,4 +45,6 @@ jobs:
           draft: false
           prerelease: ${{ steps.extract.outputs.prerelease != '' }}
           make_latest: false
+          # release name used in wash-cli (file://./../../crates/wash-cli/src/ui/mod.rs#L68)
+          name: washboard-ui-v${{ steps.extract.outputs.full }}
           files: washboard.tar.gz
